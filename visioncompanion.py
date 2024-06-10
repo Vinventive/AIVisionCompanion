@@ -41,7 +41,7 @@ sys.stdout.reconfigure(encoding='utf-8')
 # [https://www.youtube.com/@AllAboutAI]
 
 # Set up the faster-whisper model
-model_size = "medium.en"
+model_size = "large-v3"
 whisper_model = WhisperModel(model_size, device="cuda", compute_type="float16")
 
 # Model and device setup
@@ -219,6 +219,11 @@ def record_audio_with_threshold(file_path, threshold, max_silence_duration=3):
     frames = []
     silence_counter = 0
     print("Registering sound...")
+
+    # Always capture initial 1 second to avoid cutting off the start
+    for _ in range(0, int(16000 / 1024)):
+        data = stream.read(1024)
+        frames.append(data)
 
     while True:
         data = stream.read(1024)
