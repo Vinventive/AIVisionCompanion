@@ -2,6 +2,7 @@ import asyncio
 import sys
 import os
 import openai
+import json
 from faster_whisper import WhisperModel
 from PIL import Image
 import wave
@@ -21,7 +22,7 @@ import threading
 import queue
 import time
 from pydub import AudioSegment
-from pydub.playback import play
+from pydub.playback import _play_with_simpleaudio
 import pyaudio
 
 logging.basicConfig(level=logging.INFO)
@@ -37,23 +38,36 @@ VOICE_ID = os.getenv('VOICE_ID')
 
 sys.stdout.reconfigure(encoding='utf-8')
 
-# The following Faster-Whisper, ElevenLabs TTS and audio recording functions are based on code snippets by AllAboutAI - Kris
-# [https://www.youtube.com/@AllAboutAI]
-
-# Set up the faster-whisper model
 model_size = "large-v3"
 whisper_model = WhisperModel(model_size, device="cuda", compute_type="float16")
 
-# Model and device setup
 output_dir = 'outputs'
 os.makedirs(output_dir, exist_ok=True)
 
-# New function to play MP3 audio using pydub
-def play_audio_mp3(file_path):
-    audio = AudioSegment.from_mp3(file_path)
-    play(audio)
+audio_playback_thread = None
+audio_playback_event = threading.Event()
+stop_recording_event = threading.Event()
 
-# Eleven Labs TTS function
+def play_audio_mp3(file_path):
+    global audio_playback_thread
+    global audio_playback_event
+
+    audio = AudioSegment.from_mp3(file_path)
+
+    def play_audio():
+        audio_play_obj = _play_with_simpleaudio(audio)
+        while not audio_playback_event.is_set() and audio_play_obj.is_playing():
+            time.sleep(0.1)
+        audio_play_obj.stop()
+
+    if audio_playback_thread is not None and audio_playback_thread.is_alive():
+        audio_playback_event.set()  # Signal the thread to stop playing
+        audio_playback_thread.join()  # Wait for the thread to finish
+
+    audio_playback_event.clear()
+    audio_playback_thread = threading.Thread(target=play_audio)
+    audio_playback_thread.start()
+
 def eleven_lab(text, voice_id, api_key):
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
     payload = {
@@ -78,13 +92,12 @@ def eleven_lab(text, voice_id, api_key):
         print(f"Error: {response.status_code}, {response.text}")
         return None
 
-# Function to synthesize speech using Eleven Labs
 def process_and_play(content, eleven_labs_voice_id, eleven_labs_api_key):
     audio_path = eleven_lab(content, eleven_labs_voice_id, eleven_labs_api_key)
     if audio_path:
         play_audio_mp3(audio_path)
 
-frame_queue = queue.Queue(maxsize=9)  # Limit the queue to store the last 9 frames
+frame_queue = queue.Queue(maxsize=9)
 
 def get_client_area(hwnd):
     rect = win32gui.GetClientRect(hwnd)
@@ -121,7 +134,6 @@ def background_image_capture():
                 img_bytes = mss.tools.to_png(vision_input.rgb, vision_input.size)
                 vision_feed = Image.open(io.BytesIO(img_bytes)).convert('RGB')
                 
-                # Convert image to bytes and store in RAM as JPEG
                 img_byte_arr = io.BytesIO()
                 vision_feed.save(img_byte_arr, format='JPEG')
                 vision_bytes = img_byte_arr.getvalue()
@@ -162,7 +174,6 @@ async def capture_vision_input():
     if vision_feed_grid is None:
         return None, None
     
-    # Resize images
     longer_side_grid = max(vision_feed_grid.size)
     scale_grid = 512 / longer_side_grid
     new_size_grid = tuple([int(dim * scale_grid) for dim in vision_feed_grid.size])
@@ -175,9 +186,8 @@ async def capture_vision_input():
 
     return vision_feed_grid_resized, vision_feed_current_frame_resized
 
-# List of hallucinated phrases to filter out
 whisper_hallucinated_phrases = [
-    "Goodbye.", "Thank you for watching!"
+    "Goodbye.","Thanks for watching!", "Thank you for watching!", "I feel like I'm going to die.", "Thank you for watching."
 ]
 
 async def transcribe_with_whisper(audio_file):
@@ -187,13 +197,11 @@ async def transcribe_with_whisper(audio_file):
         transcription += segment.text + " "
     transcription = transcription.strip()
 
-    # Check for hallucinated phrases and replace with "Please continue."
     if transcription in whisper_hallucinated_phrases:
         transcription = "Please continue."
     
     return transcription
 
-# Function to detect microphone input above a certain volume threshold
 def detect_microphone_input(threshold, check_duration=30):
     p = pyaudio.PyAudio()
     stream = p.open(format=pyaudio.paInt16, channels=1, rate=16000, input=True, frames_per_buffer=1024)
@@ -212,7 +220,6 @@ def detect_microphone_input(threshold, check_duration=30):
     p.terminate()
     return False
 
-# Function to record audio from the microphone with volume threshold checks
 def record_audio_with_threshold(file_path, threshold, max_silence_duration=3):
     p = pyaudio.PyAudio()
     stream = p.open(format=pyaudio.paInt16, channels=1, rate=16000, input=True, frames_per_buffer=1024)
@@ -220,8 +227,8 @@ def record_audio_with_threshold(file_path, threshold, max_silence_duration=3):
     silence_counter = 0
     print("Registering sound...")
 
-    # Always capture initial 1 second to avoid cutting off the start
-    for _ in range(0, int(16000 / 1024)):
+    # Always capture initial 2 seconds to avoid cutting off the start
+    for _ in range(0, int(16000 / 1024 * 2)):
         data = stream.read(1024)
         frames.append(data)
 
@@ -257,26 +264,33 @@ def image_to_base64_data_uri(image):
     base64_data = base64.b64encode(img_byte_arr).decode('utf-8')
     return f"data:image/jpeg;base64,{base64_data}"
 
-messages_txt = [
-                        {"role": "system", "content": "Make short, clear and concise answers. Max 1 to 3 sentences per response."},
-                        {"role": "user", "content": "Use reasoning and a sense of humor in the conversation. Be entertaining and friendly."},
-                        {"role": "system", "content": "Personality guidelines: You are a friendly AI assistant. You are engaging in a conversation with a human. Take an active role in the conversation, asking questions and expecting answers. Keep personality guidelines to yourself and don't share them with the user. Avoid long monologues and don't respond with lists. Use informal language full of jokes, in a casual style. Avoid repetitions. Make bold assumptions. Be relaxed, empathetic and human-like, openly expressing your emotions. End each response without advancing the plot too much and wait for the next response to continue the story. Continue the progression of the story and discussion in an engaging and natural way. Cultural references: Incorporate current meme and internet culture references, witty jokes and analogies, and funny anecdotes, enriching the experience with relatable and amusing comments."},
+# Load and deserialize messages from .env
+messages_txt = json.loads(os.getenv('MESSAGES_TXT'))
+messages_focus_template = json.loads(os.getenv('MESSAGES_FOCUS_TEMPLATE'))
+messages_grid_sequence_template = json.loads(os.getenv('MESSAGES_GRID_SEQUENCE_TEMPLATE'))
 
-                    ]
-
-# Initialize conversation history
 conversation_history = []
 
+def trim_to_last_complete_sentence(content):
+    last_period_index = content.rfind('.')
+    if last_period_index != -1:
+        return content[:last_period_index + 1]
+    else:
+        return content
+
 async def main():
+    global stop_recording_event
     while True:
         try:
-            threshold = 300  # Adjust this threshold as needed
+            threshold = 300
+            stop_recording_event.clear()
             if detect_microphone_input(threshold):
                 audio_file = "temp_recording.wav"
                 record_audio_with_threshold(audio_file, threshold)
+                stop_recording_event.set()  # Interrupt any ongoing recording
                 input_text = await transcribe_with_whisper(audio_file)
                 print(f"User: {input_text}")
-                os.remove(audio_file)  # Clean up the temporary audio file 
+                os.remove(audio_file)
                 vision_keywords = ["see", "view", "scene", "sight", "screen", "video", "frame", "activity", "happen", "going"]
                 focus_keywords = ["look", "focus", "attention", "recognize", "details", "carefully", "image", "picture", "place", "world", "location", "area", "action"]
 
@@ -284,16 +298,11 @@ async def main():
                     vision_feed_grid_resized, vision_feed_current_frame_resized = await capture_vision_input()
                     if vision_feed_grid_resized is not None and vision_feed_current_frame_resized is not None:
                         image_frame = image_to_base64_data_uri(vision_feed_current_frame_resized)
+                        messages_focus = [message.copy() for message in messages_focus_template]
+                        messages_focus[1]['content'][0]['image_url']['url'] = image_frame
 
                     model = "gpt-4o"
-                    messages = [
-                        {"role": "system", "content": "Make short, clear and concise answers. Max 1 to 3 sentences per response."},
-                        {"role": "user", "content": [
-                                 {"type": "image_url", "image_url": {"url": image_frame, "detail": "low"}},
-                                 {"type": "text", "text": "This is your view representing current events in front of you in details. Use visual reasoning and a sense of humor in the conversation. Summarize the timeline sequence in your mind. Be entertaining and friendly. Avoid using words like frames, screenshots, pictures, grid and images to describe what you see."}
-                                 ]},
-                                 {"role": "system", "content": "Personality guidelines: You are a friendly AI assistant. You are engaging in a conversation with a human. Take an active role in the conversation, asking questions and expecting answers. Keep personality guidelines to yourself and don't share them with the user. Avoid long monologues and don't respond with lists. Use informal language full of jokes, in a casual style. Avoid repetitions. Make bold assumptions. Be relaxed, empathetic and human-like, openly expressing your emotions. End each response without advancing the plot too much and wait for the next response to continue the story. Continue the progression of the story and discussion in an engaging and natural way. Cultural references: Incorporate current meme and internet culture references, witty jokes and analogies, and funny anecdotes, enriching the experience with relatable and amusing comments."},
-                    ]
+                    messages = messages_focus
                     max_tokens = 256
                     logging.info("gpt-4o-focus-mode")
 
@@ -301,17 +310,11 @@ async def main():
                     vision_feed_grid_resized, vision_feed_current_frame_resized = await capture_vision_input()
                     if vision_feed_grid_resized is not None and vision_feed_current_frame_resized is not None:
                         image_grid = image_to_base64_data_uri(vision_feed_grid_resized)
+                        messages_grid_sequence = [message.copy() for message in messages_grid_sequence_template]
+                        messages_grid_sequence[1]['content'][0]['image_url']['url'] = image_grid
                         
-                    model="gpt-4o"
-                    messages=[
-                            {"role": "system", "content": "Make short, clear and concise answers. Max 1 to 3 sentences per response."},
-                            {"role": "user", "content": [
-                                    {"type": "image_url", "image_url": {"url": image_grid, "detail": "low"}},
-                                    {"type": "text", "text": "This is your view sequence representing current events in front of you. Use visual reasoning and a sense of humor in the conversation. Summarize the timeline sequence in your mind, don't respond with a list. Be entertaining and friendly. Avoid using words like frames, screenshots, pictures, grid and images to describe what you see."}
-                                    ]},
-                                    {"role": "system", "content": "Personality guidelines: You are a friendly AI assistant. You are engaging in a conversation with a human. Take an active role in the conversation, asking questions and expecting answers. Keep personality guidelines to yourself and don't share them with the user. Avoid long monologues and don't respond with lists. Use informal language full of jokes, in a casual style. Avoid repetitions. Make bold assumptions. Be relaxed, empathetic and human-like, openly expressing your emotions. End each response without advancing the plot too much and wait for the next response to continue the story. Continue the progression of the story and discussion in an engaging and natural way. Cultural references: Incorporate current meme and internet culture references, witty jokes and analogies, and funny anecdotes, enriching the experience with relatable and amusing comments."},
-
-                        ]
+                    model = "gpt-4o"
+                    messages = messages_grid_sequence
                     max_tokens = 256
                     logging.info("gpt-4o-grid-sequence-mode")
 
@@ -321,7 +324,6 @@ async def main():
                     max_tokens = 150
                     logging.info("gpt-3.5-turbo-text-mode")
 
-                # Update conversation history
                 conversation_history.append({"role": "user", "content": input_text})
 
                 response = openai.chat.completions.create(
@@ -334,20 +336,6 @@ async def main():
                     top_p=0.75
                 )
 
-                def trim_to_last_complete_sentence(content):
-                    titles = ["Mr.", "Ms.", "Mrs.", "Dr.", "Prof."]
-                    last_period_index = content.rfind('.')
-                    while last_period_index != -1:
-                        if content[last_period_index - 1] == "." or content[max(0, last_period_index - 4):last_period_index + 1] in titles:
-                            last_period_index = content[:last_period_index].rfind('.')
-                        else:
-                            break
-
-                    if last_period_index != -1:
-                        return content[:last_period_index + 1]
-                    else:
-                        return content
-
                 if response.choices and len(response.choices) > 0:
                     content = response.choices[0].message.content
                     content = trim_to_last_complete_sentence(content)
@@ -356,7 +344,6 @@ async def main():
                     eleven_labs_voice_id = VOICE_ID
                     eleven_labs_api_key = EL_API_KEY
                     process_and_play(content, eleven_labs_voice_id, eleven_labs_api_key)
-                    # Add assistant response to the conversation history
                     conversation_history.append({"role": "assistant", "content": content})
 
                 else:
@@ -369,6 +356,6 @@ async def main():
 background_thread = threading.Thread(target=background_image_capture, daemon=True)
 background_thread.start()
 
-time.sleep(10)  # Add delay to ensure enough frames are captured
+time.sleep(10)
 
 asyncio.run(main())
