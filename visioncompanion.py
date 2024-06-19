@@ -25,7 +25,7 @@ from pydub import AudioSegment
 from pydub.playback import _play_with_simpleaudio
 import pyaudio
 
-logging.basicConfig(level=logging.INFO)
+# logging.basicConfig(level=logging.INFO)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
