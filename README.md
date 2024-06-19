@@ -70,12 +70,24 @@ Only the window area specified by you will be captured on the screen. If you clo
 
 ### 3. Wait until the vision capture completes collecting the initial sequence of frames and speech recognition becomes active.
 ```
+Enter the title of the window: youtube
 Listening...
 ```
 
 ### 4. Start by speaking into your microphone :)
-
+```
+Enter the title of the window: youtube
+Listening...
+Registering sound...
+```
 ### 5. Seamlessly talk about your view by naturally using vision-activating keywords during the conversation.
+```
+Enter the title of the window: youtube
+Listening...
+Registering sound...
+Done.
+User: It's so funny, I love what's happening in front of me right now.
+```
 
 Keywords analyzing the sequence of the last 10 seconds.
 ```
