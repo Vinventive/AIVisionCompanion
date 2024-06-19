@@ -59,6 +59,7 @@ MESSAGES_GRID_SEQUENCE_TEMPLATE=default-template-gpt-4o-turbo-chat-completion-se
 ```
 python visioncompanion.py
 ```
+When running the script for the first time, it might take a while to download the `faster-whisper-large-v3` model for local use.
 ### 2. Type the window title.
 ```
 Enter the title of the window: youtube
