@@ -278,6 +278,9 @@ def trim_to_last_complete_sentence(content):
     else:
         return content
 
+vision_keywords = os.getenv("VISION_KEYWORDS").split(",")
+focus_keywords = os.getenv("FOCUS_KEYWORDS").split(",")
+
 async def main():
     global stop_recording_event
     while True:
@@ -291,8 +294,6 @@ async def main():
                 input_text = await transcribe_with_whisper(audio_file)
                 print(f"User: {input_text}")
                 os.remove(audio_file)
-                vision_keywords = ["see", "view", "scene", "sight", "screen", "video", "frame", "activity", "happen", "going"]
-                focus_keywords = ["look", "focus", "attention", "recognize", "details", "carefully", "image", "picture", "place", "world", "location", "area", "action"]
 
                 if any(word in input_text.lower() for word in focus_keywords):
                     vision_feed_grid_resized, vision_feed_current_frame_resized = await capture_vision_input()
