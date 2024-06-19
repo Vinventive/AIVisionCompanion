@@ -24,6 +24,9 @@ import time
 from pydub import AudioSegment
 from pydub.playback import _play_with_simpleaudio
 import pyaudio
+from TTS.tts.configs.xtts_config import XttsConfig
+from TTS.tts.models.xtts import Xtts
+import soundfile as sf
 
 logging.basicConfig(level=logging.INFO)
 
@@ -33,8 +36,9 @@ load_dotenv()
 
 openai.api_key = os.getenv('OPENAI_API_KEY')
 OPENAI_API_KEY = openai.api_key
-EL_API_KEY = os.getenv('EL_API_KEY')
-VOICE_ID = os.getenv('VOICE_ID')
+XTTS2_PATH = os.getenv('XTTS2_PATH')
+XTTS2_CONFIG = os.getenv('XTTS2_CONFIG')
+XTTS2_SAMPLE = os.getenv('XTTS2_SAMPLE')
 
 sys.stdout.reconfigure(encoding='utf-8')
 
@@ -43,6 +47,15 @@ whisper_model = WhisperModel(model_size, device="cuda", compute_type="float16")
 
 output_dir = 'outputs'
 os.makedirs(output_dir, exist_ok=True)
+
+# Load XTTS configuration
+xtts_config = XttsConfig()
+xtts_config.load_json(XTTS2_CONFIG)
+
+# Initialize XTTS model
+xtts_model = Xtts.init_from_config(xtts_config)
+xtts_model.load_checkpoint(xtts_config, checkpoint_dir=XTTS2_PATH, eval=True)
+xtts_model.cuda()  # Move the model to GPU if available
 
 audio_playback_thread = None
 audio_playback_event = threading.Event()
@@ -68,34 +81,36 @@ def play_audio_mp3(file_path):
     audio_playback_thread = threading.Thread(target=play_audio)
     audio_playback_thread.start()
 
-def eleven_lab(text, voice_id, api_key):
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-    payload = {
-        "text": text,
-        "model_id": "eleven_monolingual_v1",
-        "voice_settings": {
-            "style": 0.03,
-            "stability": 0.60,
-            "similarity_boost": 0.90
-        }
-    }
-    headers = {
-        "xi-api-key": api_key,
-        "Content-Type": "application/json"
-    }
-    response = requests.post(url, json=payload, headers=headers)
-    if response.status_code == 200:
-        with open(f'{output_dir}/eleven_labs_output.mp3', 'wb') as f:
-            f.write(response.content)
-        return f'{output_dir}/eleven_labs_output.mp3'
-    else:
-        print(f"Error: {response.status_code}, {response.text}")
-        return None
+# Function to synthesize speech using XTTS
+def process_and_play(content, audio_file_path):
+    tts_model = xtts_model
+    try:
+        # Use XTTS to synthesize speech
+        outputs = tts_model.synthesize(
+            content,  # Pass the prompt as a string directly
+            xtts_config,
+            speaker_wav=audio_file_path,  # Pass the file path directly
+            gpt_cond_len=20,
+            temperature=0.45,
+            length_penalty=1.0,
+            repetition_penalty=10.0,
+            language='en',
+            speed=1.45,  # Specify the desired language
+            enable_text_splitting=True
+        )
 
-def process_and_play(content, eleven_labs_voice_id, eleven_labs_api_key):
-    audio_path = eleven_lab(content, eleven_labs_voice_id, eleven_labs_api_key)
-    if audio_path:
+        # Get the synthesized audio tensor from the dictionary
+        synthesized_audio = outputs['wav']
+
+        # Save the synthesized audio to the output path
+        audio_path = f'{output_dir}/output.wav'
+        sample_rate = xtts_config.audio.sample_rate
+        sf.write(audio_path, synthesized_audio, sample_rate)
+
+        print("Audio generated successfully.")
         play_audio_mp3(audio_path)
+    except Exception as e:
+        print(f"Error during audio generation: {e}")
 
 frame_queue = queue.Queue(maxsize=9)
 
@@ -341,9 +356,8 @@ async def main():
                     content = trim_to_last_complete_sentence(content)
                     print(f"Assistant: {content}")
                     
-                    eleven_labs_voice_id = VOICE_ID
-                    eleven_labs_api_key = EL_API_KEY
-                    process_and_play(content, eleven_labs_voice_id, eleven_labs_api_key)
+                    audio_sample = XTTS2_SAMPLE
+                    process_and_play(content, audio_sample)
                     conversation_history.append({"role": "assistant", "content": content})
 
                 else:
