@@ -10,7 +10,6 @@ This repository features an AI vision companion/assistant that merges visual inp
 - Captures and processes vision from a specified window.
 - Transcribes audio input using Whisper.
 - Synthesizes responses using text-to-speech.
-- Support for GPU acceleration using CUDA.
 
 ## Installation
 
@@ -18,7 +17,6 @@ This repository features an AI vision companion/assistant that merges visual inp
 
 - Windows OS
 - Python 3.10 or higher
-- CUDA-compatible GPU (recommended for faster processing)
 - Microphone set as the default input device in the system settings.
 
 ### Requirements
@@ -29,11 +27,6 @@ Install the required libraries using `pip`:
 ```bash
 pip install -r requirements.txt
 ```
-
-For CUDA 11.8(GPU):
-```bash
-pip install torch==2.2.0+cu118 torchvision==0.17.0+cu118 torchaudio==2.2.0 -f https://download.pytorch.org/whl/torch_stable.html  
-```
 ### Required Environment Variables
 
 Rename the `.env.example` file to `.env` and keep it in the root directory of the project. Fill in the missing variables with your own API keys and Eleven Labs' Voice ID - you can leave the rest unchanged:
@@ -42,6 +35,7 @@ Rename the `.env.example` file to `.env` and keep it in the root directory of th
 OPENAI_API_KEY=your_openai_api_key
 EL_API_KEY=your_eleven_labs_api_key
 VOICE_ID=your_eleven_labs_voice_id
+GROQ_API=your_groq_api_key
 
 VISION_KEYWORDS=keywords-analyzing-the-sequence-of-the-last-10-seconds
 FOCUS_KEYWORDS=keywords-that-focus-on-the-details-and-the-current-view
@@ -59,7 +53,6 @@ MESSAGES_GRID_SEQUENCE_TEMPLATE=default-template-gpt-4o-turbo-chat-completion-se
 ```
 python visioncompanion.py
 ```
-When running the script for the first time, it might take a while to download the `faster-whisper-large-v3` model for local use.
 ### 2. Type the window title.
 ```
 Enter the title of the window: youtube
