@@ -3,10 +3,8 @@ import sys
 import os
 import openai
 import json
-from faster_whisper import WhisperModel
 from PIL import Image
 import wave
-import torch
 import base64
 import io
 import requests
@@ -24,10 +22,8 @@ import time
 from pydub import AudioSegment
 from pydub.playback import _play_with_simpleaudio
 import pyaudio
-
+from groq import Groq
 # logging.basicConfig(level=logging.INFO)
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 load_dotenv()
 
@@ -35,11 +31,11 @@ openai.api_key = os.getenv('OPENAI_API_KEY')
 OPENAI_API_KEY = openai.api_key
 EL_API_KEY = os.getenv('EL_API_KEY')
 VOICE_ID = os.getenv('VOICE_ID')
+GROQ_API = os.getenv('GROQ_API')
+
+groq_client = Groq(api_key=GROQ_API, )
 
 sys.stdout.reconfigure(encoding='utf-8')
-
-model_size = "large-v3"
-whisper_model = WhisperModel(model_size, device="cuda", compute_type="float16")
 
 output_dir = 'outputs'
 os.makedirs(output_dir, exist_ok=True)
@@ -190,11 +186,19 @@ whisper_hallucinated_phrases = [
     "Goodbye.","Thanks for watching!", "Thank you for watching!", "I feel like I'm going to die.", "Thank you for watching."
 ]
 
-async def transcribe_with_whisper(audio_file):
-    segments, info = whisper_model.transcribe(audio_file, beam_size=5, language="en")
-    transcription = ""
-    for segment in segments:
-        transcription += segment.text + " "
+async def transcribe_with_whisper(audio_file_path):
+    with open(audio_file_path, "rb") as audio_file:
+        file_content = audio_file.read()
+        
+    transcription = groq_client.audio.transcriptions.create(
+        file=(audio_file_path, file_content),
+        model="whisper-large-v3",
+        response_format="text",
+        language="en",
+        temperature=0.0
+    )
+    
+    # Assuming the transcription is returned as a string
     transcription = transcription.strip()
 
     if transcription in whisper_hallucinated_phrases:
