@@ -20,10 +20,9 @@ This repository features an AI vision companion/assistant that merges visual inp
 - Python 3.10 or higher
 - CUDA-compatible GPU (recommended for faster processing)
 - Microphone set as the default input device in the system settings.
-- Preinstalled and ready to use coqui/XTTS-2 
 
 ### Requirements
-The following environment configuration was used for testing: Windows 10 Pro x64, Python 3.10.11 64-bit, and CUDA 11.8 with preinstalled coqui/XTTS-2.
+The following environment configuration was used for testing: Windows 10 Pro x64, Python 3.10.11 64-bit, and CUDA 11.8.
 
 Install the required libraries using `pip`:
 
@@ -36,8 +35,7 @@ For CUDA 11.8(GPU):
 pip install torch==2.2.0+cu118 torchvision==0.17.0+cu118 torchaudio==2.2.0 -f https://download.pytorch.org/whl/torch_stable.html  
 ```
 
-To install Coqui/XTTS-2:
-Make sure you have git-lfs installed (https://git-lfs.com)
+To install Coqui/XTTS-2 make sure you have git-lfs installed (https://git-lfs.com)
 ```
 git lfs install
 ```
