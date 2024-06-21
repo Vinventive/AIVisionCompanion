@@ -94,4 +94,4 @@ Keywords that focus on the details and the current view.
 You have the option to add or remove keywords in the `.env` file.
 ## License
 
-It's obviously open-source under the MIT license—no need to credit me. The vision capture functions have agentic potential if you build upon and change a few lines in the code. The only thing I’d like to ask is, if you’re reading this and planning on reusing any part of code from this repository in your own projects, to "consider" sharing it open-source later. It's not required but that would make me happy if we can collectively push things one step forward for everyone else :)
+This project is open-source under the MIT license—no need to credit me. The vision capture functions have agentic potential if you build upon and tweak a few lines in the code. The only thing I’d like to ask is, if you’re reading this and planning on reusing any part of the code from this repository in your own projects, to "consider" sharing it open-source later. It's not required, but that would make me happy if we can collectively push things one step forward for everyone else :)
