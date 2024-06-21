@@ -1,0 +1,15 @@
+asyncio
+openai
+faster-whisper
+Pillow
+torch
+pywin32
+mss
+pygetwindow
+numpy
+python-dotenv
+logging
+pydub
+simpleaudio
+pyaudio
+tts
