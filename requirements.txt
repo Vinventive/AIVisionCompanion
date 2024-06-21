@@ -1,8 +1,6 @@
 asyncio
 openai
-faster-whisper
 Pillow
-torch
 requests
 pywin32
 mss
@@ -13,3 +11,4 @@ logging
 pydub
 simpleaudio
 pyaudio
+groq
