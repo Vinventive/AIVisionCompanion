@@ -9,7 +9,6 @@ import wave
 import torch
 import base64
 import io
-import requests
 import win32gui
 import win32con
 import mss
