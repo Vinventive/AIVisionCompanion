@@ -22,8 +22,8 @@ import threading
 import queue
 import time
 from pydub import AudioSegment
-from pydub.playback import _play_with_simpleaudio
 import pyaudio
+import aiohttp
 
 # logging.basicConfig(level=logging.INFO)
 
@@ -44,32 +44,57 @@ whisper_model = WhisperModel(model_size, device="cuda", compute_type="float16")
 output_dir = 'outputs'
 os.makedirs(output_dir, exist_ok=True)
 
-audio_playback_thread = None
-audio_playback_event = threading.Event()
+audio_queue = queue.Queue()
+playback_thread = None
+playback_stop_event = threading.Event()
 stop_recording_event = threading.Event()
 
-def play_audio_mp3(file_path):
-    global audio_playback_thread
-    global audio_playback_event
+def audio_playback_worker():
+    p = pyaudio.PyAudio()
+    stream = p.open(format=pyaudio.paInt16,
+                    channels=1,
+                    rate=44100,
+                    output=True)
+    
+    while not playback_stop_event.is_set():
+        try:
+            audio_segment = audio_queue.get(timeout=0.1)
+            chunk_size = 1024
+            for i in range(0, len(audio_segment), chunk_size):
+                if playback_stop_event.is_set():
+                    break
+                chunk = audio_segment[i:i+chunk_size].raw_data
+                stream.write(chunk)
+            audio_queue.task_done()
+        except queue.Empty:
+            continue
 
-    audio = AudioSegment.from_mp3(file_path)
+    stream.stop_stream()
+    stream.close()
+    p.terminate()
 
-    def play_audio():
-        audio_play_obj = _play_with_simpleaudio(audio)
-        while not audio_playback_event.is_set() and audio_play_obj.is_playing():
-            time.sleep(0.1)
-        audio_play_obj.stop()
+def start_audio_playback_thread():
+    global playback_thread
+    if playback_thread is None or not playback_thread.is_alive():
+        playback_stop_event.clear()
+        playback_thread = threading.Thread(target=audio_playback_worker)
+        playback_thread.start()
 
-    if audio_playback_thread is not None and audio_playback_thread.is_alive():
-        audio_playback_event.set()  # Signal the thread to stop playing
-        audio_playback_thread.join()  # Wait for the thread to finish
+def stop_audio_playback():
+    global playback_thread
+    playback_stop_event.set()
+    with audio_queue.mutex:
+        audio_queue.queue.clear()
+    if playback_thread:
+        playback_thread.join()
+    playback_thread = None
 
-    audio_playback_event.clear()
-    audio_playback_thread = threading.Thread(target=play_audio)
-    audio_playback_thread.start()
-
-def eleven_lab(text, voice_id, api_key):
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+async def stream_eleven_labs(text, voice_id, api_key):
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream"
+    headers = {
+        "xi-api-key": api_key,
+        "Content-Type": "application/json"
+    }
     payload = {
         "text": text,
         "model_id": "eleven_monolingual_v1",
@@ -79,23 +104,22 @@ def eleven_lab(text, voice_id, api_key):
             "similarity_boost": 0.90
         }
     }
-    headers = {
-        "xi-api-key": api_key,
-        "Content-Type": "application/json"
-    }
-    response = requests.post(url, json=payload, headers=headers)
-    if response.status_code == 200:
-        with open(f'{output_dir}/eleven_labs_output.mp3', 'wb') as f:
-            f.write(response.content)
-        return f'{output_dir}/eleven_labs_output.mp3'
-    else:
-        print(f"Error: {response.status_code}, {response.text}")
-        return None
 
-def process_and_play(content, eleven_labs_voice_id, eleven_labs_api_key):
-    audio_path = eleven_lab(content, eleven_labs_voice_id, eleven_labs_api_key)
-    if audio_path:
-        play_audio_mp3(audio_path)
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, json=payload, headers=headers) as response:
+            if response.status == 200:
+                return await response.read()
+            else:
+                print(f"Error: {response.status}, {await response.text()}")
+                return None
+
+async def process_and_play_streaming(sentence, voice_id, api_key):
+    audio_data = await stream_eleven_labs(sentence, voice_id, api_key)
+    if audio_data:
+        audio_segment = AudioSegment.from_mp3(io.BytesIO(audio_data))
+        audio_segment = audio_segment.set_channels(1).set_frame_rate(44100)
+        audio_queue.put(audio_segment)
+        start_audio_playback_thread()
 
 frame_queue = queue.Queue(maxsize=9)
 
@@ -220,7 +244,7 @@ def detect_microphone_input(threshold, check_duration=30):
     p.terminate()
     return False
 
-def record_audio_with_threshold(file_path, threshold, max_silence_duration=3):
+def record_audio_with_threshold(file_path, threshold, max_silence_duration=2):
     p = pyaudio.PyAudio()
     stream = p.open(format=pyaudio.paInt16, channels=1, rate=16000, input=True, frames_per_buffer=1024)
     frames = []
@@ -281,13 +305,44 @@ def trim_to_last_complete_sentence(content):
 vision_keywords = os.getenv("VISION_KEYWORDS").split(",")
 focus_keywords = os.getenv("FOCUS_KEYWORDS").split(",")
 
+async def stream_openai_response(client, model, messages, max_tokens, temperature, top_p, frequency_penalty, presence_penalty):
+    stream = await client.chat.completions.create(
+        model=model,
+        messages=messages,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        frequency_penalty=frequency_penalty,
+        presence_penalty=presence_penalty,
+        stream=True
+    )
+
+    full_response = ""
+    current_sentence = ""
+
+    async for chunk in stream:
+        if chunk.choices[0].delta.content is not None:
+            content = chunk.choices[0].delta.content
+            full_response += content
+            current_sentence += content
+
+            if content.endswith(('.', '!', '?')):
+                yield current_sentence.strip()
+                current_sentence = ""
+
+    if current_sentence:
+        yield current_sentence.strip()
+
 async def main():
     global stop_recording_event
+    client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
+
     while True:
         try:
-            threshold = 300
+            threshold = 500
             stop_recording_event.clear()
             if detect_microphone_input(threshold):
+                stop_audio_playback()  # Stop any ongoing playback
                 audio_file = "temp_recording.wav"
                 record_audio_with_threshold(audio_file, threshold)
                 stop_recording_event.set()  # Interrupt any ongoing recording
@@ -327,36 +382,36 @@ async def main():
 
                 conversation_history.append({"role": "user", "content": input_text})
 
-                response = openai.chat.completions.create(
-                    model=model,
-                    messages=messages + conversation_history,
-                    frequency_penalty=1.2,
-                    presence_penalty=1.1,
-                    max_tokens=max_tokens,
-                    temperature=0.35,
-                    top_p=0.75
-                )
-
-                if response.choices and len(response.choices) > 0:
-                    content = response.choices[0].message.content
-                    content = trim_to_last_complete_sentence(content)
-                    print(f"Assistant: {content}")
+                full_response = ""
+                sentence_buffer = ""
+                async for sentence in stream_openai_response(client, model, messages + conversation_history, max_tokens, 0.35, 0.75, 1.2, 1.1):
+                    full_response += sentence + " "
+                    sentence_buffer += sentence + " "
                     
-                    eleven_labs_voice_id = VOICE_ID
-                    eleven_labs_api_key = EL_API_KEY
-                    process_and_play(content, eleven_labs_voice_id, eleven_labs_api_key)
-                    conversation_history.append({"role": "assistant", "content": content})
+                    # Process and queue audio for complete sentences
+                    if sentence.strip().endswith(('.', '!', '?')):
+                        print(f"Assistant: {sentence_buffer.strip()}")
+                        await process_and_play_streaming(sentence_buffer.strip(), VOICE_ID, EL_API_KEY)
+                        sentence_buffer = ""
 
-                else:
-                    print("No response content received.")
+                # Process any remaining text in the buffer
+                if sentence_buffer.strip():
+                    print(f"Assistant: {sentence_buffer.strip()}")
+                    await process_and_play_streaming(sentence_buffer.strip(), VOICE_ID, EL_API_KEY)
+
+                conversation_history.append({"role": "assistant", "content": full_response.strip()})
 
         except Exception as e:
             logging.error(f"An error occurred: {e}")
             continue
 
+# Start the background image capture thread
 background_thread = threading.Thread(target=background_image_capture, daemon=True)
 background_thread.start()
 
+# Wait for initial frames to be captured
 time.sleep(10)
 
-asyncio.run(main())
+# Run the main asyncio event loop
+if __name__ == "__main__":
+    asyncio.run(main())
