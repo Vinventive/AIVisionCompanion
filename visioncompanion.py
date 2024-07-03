@@ -5,7 +5,6 @@ import openai
 import json
 from PIL import Image
 import wave
-import torch
 import base64
 import io
 import win32gui
@@ -24,8 +23,6 @@ import pyaudio
 import aiohttp
 from groq import Groq
 # logging.basicConfig(level=logging.INFO)
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 load_dotenv()
 
