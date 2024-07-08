@@ -21,13 +21,15 @@ import threading
 import queue
 import time
 from pydub import AudioSegment
-from pydub.playback import _play_with_simpleaudio
 import pyaudio
 from TTS.tts.configs.xtts_config import XttsConfig
 from TTS.tts.models.xtts import Xtts
 import soundfile as sf
+import psutil
 
-logging.basicConfig(level=logging.INFO)
+# Set up logging
+# logging.basicConfig(filename='app.log', level=logging.DEBUG, 
+#                     format='%(asctime)s %(levelname)s:%(message)s')
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -56,60 +58,99 @@ xtts_model = Xtts.init_from_config(xtts_config)
 xtts_model.load_checkpoint(xtts_config, checkpoint_dir=XTTS2_PATH, eval=True)
 xtts_model.cuda()  # Move the model to GPU if available
 
-audio_playback_thread = None
-audio_playback_event = threading.Event()
+audio_queue = queue.Queue()
+playback_thread = None
+playback_stop_event = threading.Event()
 stop_recording_event = threading.Event()
 
-def play_audio_mp3(file_path):
-    global audio_playback_thread
-    global audio_playback_event
+def log_memory_usage():
+    process = psutil.Process()
+    mem_info = process.memory_info()
+    logging.info(f"Memory usage: {mem_info.rss / 1024 / 1024:.2f} MB")
+    if torch.cuda.is_available():
+        logging.info(f"GPU memory allocated: {torch.cuda.memory_allocated() / 1024 / 1024:.2f} MB")
 
-    audio = AudioSegment.from_mp3(file_path)
+def audio_playback_worker():
+    p = pyaudio.PyAudio()
+    stream = p.open(format=pyaudio.paInt16,
+                    channels=1,
+                    rate=44100,
+                    output=True)
+    
+    while not playback_stop_event.is_set():
+        try:
+            audio_segment = audio_queue.get(timeout=0.1)
+            chunk_size = 512
+            for i in range(0, len(audio_segment), chunk_size):
+                if playback_stop_event.is_set():
+                    break
+                chunk = audio_segment[i:i+chunk_size].raw_data
+                stream.write(chunk)
+            audio_queue.task_done()
+        except queue.Empty:
+            continue
+        except Exception as e:
+            logging.error(f"Error in audio playback: {e}")
 
-    def play_audio():
-        audio_play_obj = _play_with_simpleaudio(audio)
-        while not audio_playback_event.is_set() and audio_play_obj.is_playing():
-            time.sleep(0.1)
-        audio_play_obj.stop()
+    stream.stop_stream()
+    stream.close()
+    p.terminate()
 
-    if audio_playback_thread is not None and audio_playback_thread.is_alive():
-        audio_playback_event.set()  # Signal the thread to stop playing
-        audio_playback_thread.join()  # Wait for the thread to finish
+def start_audio_playback_thread():
+    global playback_thread
+    if playback_thread is None or not playback_thread.is_alive():
+        playback_stop_event.clear()
+        playback_thread = threading.Thread(target=audio_playback_worker)
+        playback_thread.start()
 
-    audio_playback_event.clear()
-    audio_playback_thread = threading.Thread(target=play_audio)
-    audio_playback_thread.start()
+def stop_audio_playback():
+    global playback_thread
+    playback_stop_event.set()
+    with audio_queue.mutex:
+        audio_queue.queue.clear()
+    if playback_thread:
+        playback_thread.join()
+    playback_thread = None
 
-# Function to synthesize speech using XTTS
-def process_and_play(content, audio_file_path):
-    tts_model = xtts_model
+async def stream_xtts2(text, sample_path):
     try:
-        # Use XTTS to synthesize speech
-        outputs = tts_model.synthesize(
-            content,  # Pass the prompt as a string directly
+        log_memory_usage()
+        outputs = xtts_model.synthesize(
+            text,
             xtts_config,
-            speaker_wav=audio_file_path,  # Pass the file path directly
-            gpt_cond_len=20,
-            temperature=0.45,
+            speaker_wav=sample_path,
+            gpt_cond_len=10,
+            temperature=0.9,
+            top_p=0.7,
             length_penalty=1.0,
-            repetition_penalty=10.0,
+            repetition_penalty=6.0,
             language='en',
-            speed=1.45,  # Specify the desired language
-            enable_text_splitting=True
+            speed=1.35,
+            enable_text_splitting=False
         )
-
-        # Get the synthesized audio tensor from the dictionary
-        synthesized_audio = outputs['wav']
-
-        # Save the synthesized audio to the output path
-        audio_path = f'{output_dir}/output.wav'
+        
+        audio = outputs['wav']
         sample_rate = xtts_config.audio.sample_rate
-        sf.write(audio_path, synthesized_audio, sample_rate)
-
-        print("Audio generated successfully.")
-        play_audio_mp3(audio_path)
+        
+        # Convert the audio to a bytes object
+        buffer = io.BytesIO()
+        sf.write(buffer, audio, sample_rate, format='wav')
+        buffer.seek(0)
+        
+        return buffer.getvalue()
     except Exception as e:
-        print(f"Error during audio generation: {e}")
+        logging.error(f"Error in stream_xtts2: {e}")
+        return None
+
+async def process_and_play_streaming(audio_data):
+    try:
+        if audio_data:
+            audio_segment = AudioSegment.from_wav(io.BytesIO(audio_data))
+            audio_segment = audio_segment.set_channels(1).set_frame_rate(44100)
+            audio_queue.put(audio_segment)
+            start_audio_playback_thread()
+    except Exception as e:
+        logging.error(f"Error in process_and_play_streaming: {e}")
 
 frame_queue = queue.Queue(maxsize=9)
 
@@ -201,75 +242,87 @@ async def capture_vision_input():
     return vision_feed_grid_resized, vision_feed_current_frame_resized
 
 whisper_hallucinated_phrases = [
-    "Goodbye.","Thanks for watching!", "Thank you for watching!", "I feel like I'm going to die.", "Thank you for watching."
+    "Goodbye.","Thanks for watching!", "Thank you for watching!", "I feel like I'm going to die.", "Thank you for watching.", "Transcription by CastingWords"
 ]
 
 async def transcribe_with_whisper(audio_file):
-    segments, info = whisper_model.transcribe(audio_file, beam_size=5, language="en")
-    transcription = ""
-    for segment in segments:
-        transcription += segment.text + " "
-    transcription = transcription.strip()
+    try:
+        segments, info = whisper_model.transcribe(audio_file, beam_size=5, language="en")
+        transcription = ""
+        for segment in segments:
+            transcription += segment.text + " "
+        transcription = transcription.strip()
 
-    if transcription in whisper_hallucinated_phrases:
-        transcription = "Please continue."
-    
-    return transcription
-
-def detect_microphone_input(threshold, check_duration=30):
-    p = pyaudio.PyAudio()
-    stream = p.open(format=pyaudio.paInt16, channels=1, rate=16000, input=True, frames_per_buffer=1024)
-    print("Listening...")
-    for _ in range(0, int(16000 / 1024 * check_duration)):
-        data = stream.read(1024)
-        audio_data = np.frombuffer(data, np.int16)
-        volume = np.linalg.norm(audio_data) / np.sqrt(len(audio_data))
-        if volume > threshold:
-            stream.stop_stream()
-            stream.close()
-            p.terminate()
-            return True
-    stream.stop_stream()
-    stream.close()
-    p.terminate()
-    return False
-
-def record_audio_with_threshold(file_path, threshold, max_silence_duration=3):
-    p = pyaudio.PyAudio()
-    stream = p.open(format=pyaudio.paInt16, channels=1, rate=16000, input=True, frames_per_buffer=1024)
-    frames = []
-    silence_counter = 0
-    print("Registering sound...")
-
-    # Always capture initial 2 seconds to avoid cutting off the start
-    for _ in range(0, int(16000 / 1024 * 2)):
-        data = stream.read(1024)
-        frames.append(data)
-
-    while True:
-        data = stream.read(1024)
-        frames.append(data)
-        audio_data = np.frombuffer(data, np.int16)
-        volume = np.linalg.norm(audio_data) / np.sqrt(len(audio_data))
+        if transcription in whisper_hallucinated_phrases:
+            transcription = "Please continue."
         
-        if volume < threshold:
-            silence_counter += 1
-        else:
-            silence_counter = 0
-        
-        if silence_counter > int(16000 / 1024 * max_silence_duration):
-            break
+        return transcription
+    except Exception as e:
+        logging.error(f"Error in transcribe_with_whisper: {e}")
+        return "Error in transcription"
 
-    print("Done.")
-    stream.stop_stream()
-    stream.close()
-    p.terminate()
-    wf = wave.open(file_path, 'wb')
-    wf.setnchannels(1)
-    wf.setsampwidth(p.get_sample_size(pyaudio.paInt16))
-    wf.setframerate(16000)
-    wf.writeframes(b''.join(frames))
-    wf.close()
+def detect_microphone_input(threshold, check_duration=17):
+    try:
+        p = pyaudio.PyAudio()
+        stream = p.open(format=pyaudio.paInt16, channels=1, rate=16000, input=True, frames_per_buffer=1024)
+        print("Listening...")
+        for _ in range(0, int(16000 / 1024 * check_duration)):
+            data = stream.read(1024)
+            audio_data = np.frombuffer(data, np.int16)
+            volume = np.linalg.norm(audio_data) / np.sqrt(len(audio_data))
+            if volume > threshold:
+                stream.stop_stream()
+                stream.close()
+                p.terminate()
+                return True
+        stream.stop_stream()
+        stream.close()
+        p.terminate()
+        
+        return "Share what you think is happening."
+    except Exception as e:
+        logging.error(f"Error in detect_microphone_input: {e}")
+        return False
+
+def record_audio_with_threshold(file_path, threshold, max_silence_duration=1):
+    try:
+        p = pyaudio.PyAudio()
+        stream = p.open(format=pyaudio.paInt16, channels=1, rate=16000, input=True, frames_per_buffer=1024)
+        frames = []
+        silence_counter = 0
+        print("Registering sound...")
+
+        # Always capture initial 2 seconds to avoid cutting off the start
+        for _ in range(0, int(16000 / 1024 * 2)):
+            data = stream.read(1024)
+            frames.append(data)
+
+        while True:
+            data = stream.read(1024)
+            frames.append(data)
+            audio_data = np.frombuffer(data, np.int16)
+            volume = np.linalg.norm(audio_data) / np.sqrt(len(audio_data))
+            
+            if volume < threshold:
+                silence_counter += 1
+            else:
+                silence_counter = 0
+            
+            if silence_counter > int(16000 / 1024 * max_silence_duration):
+                break
+
+        print("Done.")
+        stream.stop_stream()
+        stream.close()
+        p.terminate()
+        wf = wave.open(file_path, 'wb')
+        wf.setnchannels(1)
+        wf.setsampwidth(p.get_sample_size(pyaudio.paInt16))
+        wf.setframerate(16000)
+        wf.writeframes(b''.join(frames))
+        wf.close()
+    except Exception as e:
+        logging.error(f"Error in record_audio_with_threshold: {e}")
 
 def image_to_base64_data_uri(image):
     img_byte_arr = io.BytesIO()
@@ -292,83 +345,140 @@ def trim_to_last_complete_sentence(content):
     else:
         return content
 
+vision_keywords = os.getenv("VISION_KEYWORDS").split(",")
+focus_keywords = os.getenv("FOCUS_KEYWORDS").split(",")
+
+async def stream_openai_response(client, model, messages, max_tokens, temperature, top_p, frequency_penalty, presence_penalty):
+    try:
+        stream = await client.chat.completions.create(
+            model=model,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
+            stream=True
+        )
+
+        full_response = ""
+        current_sentence = ""
+
+        async for chunk in stream:
+            if chunk.choices[0].delta.content is not None:
+                content = chunk.choices[0].delta.content
+                full_response += content
+                current_sentence += content
+
+                if content.endswith(('.', '!', '?')):
+                    yield current_sentence.strip()
+                    current_sentence = ""
+
+        if current_sentence:
+            yield current_sentence.strip()
+    except Exception as e:
+        logging.error(f"Error in stream_openai_response: {e}")
+        yield "Error in generating response"
+
 async def main():
     global stop_recording_event
+    client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
+
     while True:
         try:
-            threshold = 300
+            threshold = 250
             stop_recording_event.clear()
-            if detect_microphone_input(threshold):
+            mic_input_result = detect_microphone_input(threshold)
+            
+            if mic_input_result == True:
+                stop_audio_playback()  # Stop any ongoing playback
                 audio_file = "temp_recording.wav"
                 record_audio_with_threshold(audio_file, threshold)
                 stop_recording_event.set()  # Interrupt any ongoing recording
                 input_text = await transcribe_with_whisper(audio_file)
                 print(f"User: {input_text}")
                 os.remove(audio_file)
-                vision_keywords = ["see", "view", "scene", "sight", "screen", "video", "frame", "activity", "happen", "going"]
-                focus_keywords = ["look", "focus", "attention", "recognize", "details", "carefully", "image", "picture", "place", "world", "location", "area", "action"]
+            elif mic_input_result == "Share what you think is happening.":
+                input_text = mic_input_result
+                print(f"User: {input_text}")
+            else:
+                continue  # Skip this iteration if False is returned
 
-                if any(word in input_text.lower() for word in focus_keywords):
-                    vision_feed_grid_resized, vision_feed_current_frame_resized = await capture_vision_input()
-                    if vision_feed_grid_resized is not None and vision_feed_current_frame_resized is not None:
-                        image_frame = image_to_base64_data_uri(vision_feed_current_frame_resized)
-                        messages_focus = [message.copy() for message in messages_focus_template]
-                        messages_focus[1]['content'][0]['image_url']['url'] = image_frame
+            if any(word in input_text.lower() for word in focus_keywords):
+                vision_feed_grid_resized, vision_feed_current_frame_resized = await capture_vision_input()
+                if vision_feed_grid_resized is not None and vision_feed_current_frame_resized is not None:
+                    image_frame = image_to_base64_data_uri(vision_feed_current_frame_resized)
+                    messages_focus = [message.copy() for message in messages_focus_template]
+                    messages_focus[1]['content'][0]['image_url']['url'] = image_frame
 
-                    model = "gpt-4o"
-                    messages = messages_focus
-                    max_tokens = 256
-                    logging.info("gpt-4o-focus-mode")
+                model = "gpt-4o"
+                messages = messages_focus
+                max_tokens = 256
+                logging.info("gpt-4o-focus-mode")
 
-                elif any(word in input_text.lower() for word in vision_keywords):
-                    vision_feed_grid_resized, vision_feed_current_frame_resized = await capture_vision_input()
-                    if vision_feed_grid_resized is not None and vision_feed_current_frame_resized is not None:
-                        image_grid = image_to_base64_data_uri(vision_feed_grid_resized)
-                        messages_grid_sequence = [message.copy() for message in messages_grid_sequence_template]
-                        messages_grid_sequence[1]['content'][0]['image_url']['url'] = image_grid
-                        
-                    model = "gpt-4o"
-                    messages = messages_grid_sequence
-                    max_tokens = 256
-                    logging.info("gpt-4o-grid-sequence-mode")
-
-                else:
-                    model = "gpt-3.5-turbo"
-                    messages = messages_txt
-                    max_tokens = 150
-                    logging.info("gpt-3.5-turbo-text-mode")
-
-                conversation_history.append({"role": "user", "content": input_text})
-
-                response = openai.chat.completions.create(
-                    model=model,
-                    messages=messages + conversation_history,
-                    frequency_penalty=1.2,
-                    presence_penalty=1.1,
-                    max_tokens=max_tokens,
-                    temperature=0.35,
-                    top_p=0.75
-                )
-
-                if response.choices and len(response.choices) > 0:
-                    content = response.choices[0].message.content
-                    content = trim_to_last_complete_sentence(content)
-                    print(f"Assistant: {content}")
+            elif any(word in input_text.lower() for word in vision_keywords):
+                vision_feed_grid_resized, vision_feed_current_frame_resized = await capture_vision_input()
+                if vision_feed_grid_resized is not None and vision_feed_current_frame_resized is not None:
+                    image_grid = image_to_base64_data_uri(vision_feed_grid_resized)
+                    messages_grid_sequence = [message.copy() for message in messages_grid_sequence_template]
+                    messages_grid_sequence[1]['content'][0]['image_url']['url'] = image_grid
                     
-                    audio_sample = XTTS2_SAMPLE
-                    process_and_play(content, audio_sample)
-                    conversation_history.append({"role": "assistant", "content": content})
+                model = "gpt-4o"
+                messages = messages_grid_sequence
+                max_tokens = 256
+                logging.info("gpt-4o-grid-sequence-mode")
 
+            else:
+                model = "gpt-3.5-turbo"
+                messages = messages_txt
+                max_tokens = 150
+                logging.info("gpt-3.5-turbo-text-mode")
+
+            conversation_history.append({"role": "user", "content": input_text})
+
+            full_response = ""
+            sentence_buffer = ""
+            async for sentence in stream_openai_response(client, model, messages + conversation_history, max_tokens, 0.35, 0.9, 1.2, 1.1):
+                full_response += sentence + " "
+                sentence_buffer += sentence + " "
+                
+                # Process and queue audio for complete sentences
+                if sentence.strip().endswith(('.', '!', '?')):
+                    print(f"Assistant: {sentence_buffer.strip()}")
+                    audio_data = await stream_xtts2(sentence_buffer.strip(), XTTS2_SAMPLE)
+                    if audio_data:
+                        await process_and_play_streaming(audio_data)
+                    else:
+                        logging.warning("Failed to generate audio, skipping playback")
+                    sentence_buffer = ""
+
+            # Process any remaining text in the buffer
+            if sentence_buffer.strip():
+                print(f"Assistant: {sentence_buffer.strip()}")
+                audio_data = await stream_xtts2(sentence_buffer.strip(), XTTS2_SAMPLE)
+                if audio_data:
+                    await process_and_play_streaming(audio_data)
                 else:
-                    print("No response content received.")
+                    logging.warning("Failed to generate audio, skipping playback")
+
+            conversation_history.append({"role": "assistant", "content": full_response.strip()})
 
         except Exception as e:
-            logging.error(f"An error occurred: {e}")
+            logging.error(f"An error occurred in main loop: {e}")
             continue
 
+        finally:
+            # Clean up resources
+            torch.cuda.empty_cache()
+            log_memory_usage()
+
+# Start the background image capture thread
 background_thread = threading.Thread(target=background_image_capture, daemon=True)
 background_thread.start()
 
+# Wait for initial frames to be captured
 time.sleep(10)
 
-asyncio.run(main())
+# Run the main asyncio event loop
+if __name__ == "__main__":
+    asyncio.run(main())
