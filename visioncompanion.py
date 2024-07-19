@@ -17,44 +17,62 @@ import pygetwindow as gw
 import numpy as np
 from dotenv import load_dotenv
 import logging
-import logging.handlers
 import threading
 import queue
 import time
 from pydub import AudioSegment
 import pyaudio
 import aiohttp
+from concurrent.futures import ThreadPoolExecutor
 
-# logging.basicConfig(level=logging.INFO)
+# Configure logging
+# logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+# Load environment variables
 load_dotenv()
 
+# Set up API keys and constants
 openai.api_key = os.getenv('OPENAI_API_KEY')
 OPENAI_API_KEY = openai.api_key
 EL_API_KEY = os.getenv('EL_API_KEY')
 VOICE_ID = os.getenv('VOICE_ID')
 
+# Configure system settings
 sys.stdout.reconfigure(encoding='utf-8')
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# Initialize Whisper model
 model_size = "large-v3"
 whisper_model = WhisperModel(model_size, device="cuda", compute_type="float16")
 
+# Set up output directory
 output_dir = 'outputs'
 os.makedirs(output_dir, exist_ok=True)
 
+# Initialize queues and events
 audio_queue = queue.Queue()
-playback_thread = None
+frame_queue = queue.Queue(maxsize=9)
 playback_stop_event = threading.Event()
 stop_recording_event = threading.Event()
 
+# Load conversation templates and keywords
+messages_focus_template = json.loads(os.getenv('MESSAGES_FOCUS_TEMPLATE'))
+messages_grid_sequence_template = json.loads(os.getenv('MESSAGES_GRID_SEQUENCE_TEMPLATE'))
+vision_keywords = os.getenv("VISION_KEYWORDS").split(",")
+focus_keywords = os.getenv("FOCUS_KEYWORDS").split(",")
+
+# Initialize conversation history
+conversation_history = []
+
+# Whisper hallucination phrases
+whisper_hallucinated_phrases = [
+    "Goodbye.", "Thanks for watching!", "Thank you for watching!", 
+    "I feel like I'm going to die.", "Thank you for watching."
+]
+
 def audio_playback_worker():
     p = pyaudio.PyAudio()
-    stream = p.open(format=pyaudio.paInt16,
-                    channels=1,
-                    rate=44100,
-                    output=True)
+    stream = p.open(format=pyaudio.paInt16, channels=1, rate=44100, output=True)
     
     while not playback_stop_event.is_set():
         try:
@@ -75,19 +93,17 @@ def audio_playback_worker():
 
 def start_audio_playback_thread():
     global playback_thread
-    if playback_thread is None or not playback_thread.is_alive():
+    if not hasattr(start_audio_playback_thread, 'playback_thread') or not start_audio_playback_thread.playback_thread.is_alive():
         playback_stop_event.clear()
-        playback_thread = threading.Thread(target=audio_playback_worker)
-        playback_thread.start()
+        start_audio_playback_thread.playback_thread = threading.Thread(target=audio_playback_worker)
+        start_audio_playback_thread.playback_thread.start()
 
 def stop_audio_playback():
-    global playback_thread
     playback_stop_event.set()
     with audio_queue.mutex:
         audio_queue.queue.clear()
-    if playback_thread:
-        playback_thread.join()
-    playback_thread = None
+    if hasattr(start_audio_playback_thread, 'playback_thread'):
+        start_audio_playback_thread.playback_thread.join()
 
 async def stream_eleven_labs(text, voice_id, api_key):
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream"
@@ -110,7 +126,7 @@ async def stream_eleven_labs(text, voice_id, api_key):
             if response.status == 200:
                 return await response.read()
             else:
-                print(f"Error: {response.status}, {await response.text()}")
+                logging.error(f"ElevenLabs API error: {response.status}, {await response.text()}")
                 return None
 
 async def process_and_play_streaming(sentence, voice_id, api_key):
@@ -121,18 +137,12 @@ async def process_and_play_streaming(sentence, voice_id, api_key):
         audio_queue.put(audio_segment)
         start_audio_playback_thread()
 
-frame_queue = queue.Queue(maxsize=9)
-
 def get_client_area(hwnd):
     rect = win32gui.GetClientRect(hwnd)
     point = win32gui.ClientToScreen(hwnd, (rect[0], rect[1]))
     return (point[0], point[1], rect[2] - rect[0], rect[3] - rect[1])
 
-window_title = input("Enter the title of the window: ")
-
-logging.info("Loading frames. Please wait...")
-
-def background_image_capture():
+def background_image_capture(window_title):
     while True:
         try:
             window = gw.getWindowsWithTitle(window_title)
@@ -210,10 +220,6 @@ async def capture_vision_input():
 
     return vision_feed_grid_resized, vision_feed_current_frame_resized
 
-whisper_hallucinated_phrases = [
-    "Goodbye.","Thanks for watching!", "Thank you for watching!", "I feel like I'm going to die.", "Thank you for watching."
-]
-
 async def transcribe_with_whisper(audio_file):
     segments, info = whisper_model.transcribe(audio_file, beam_size=5, language="en")
     transcription = ""
@@ -229,7 +235,10 @@ async def transcribe_with_whisper(audio_file):
 def detect_microphone_input(threshold, check_duration=30):
     p = pyaudio.PyAudio()
     stream = p.open(format=pyaudio.paInt16, channels=1, rate=16000, input=True, frames_per_buffer=1024)
-    print("Listening...")
+    
+    sys.stdout.write("\rListening... ")
+    sys.stdout.flush()
+    
     for _ in range(0, int(16000 / 1024 * check_duration)):
         data = stream.read(1024)
         audio_data = np.frombuffer(data, np.int16)
@@ -288,22 +297,43 @@ def image_to_base64_data_uri(image):
     base64_data = base64.b64encode(img_byte_arr).decode('utf-8')
     return f"data:image/jpeg;base64,{base64_data}"
 
-# Load and deserialize messages from .env
-messages_txt = json.loads(os.getenv('MESSAGES_TXT'))
-messages_focus_template = json.loads(os.getenv('MESSAGES_FOCUS_TEMPLATE'))
-messages_grid_sequence_template = json.loads(os.getenv('MESSAGES_GRID_SEQUENCE_TEMPLATE'))
+def trim_conversation_history(max_words):
+    global conversation_history
+    total_words = sum(len(message['content'].split()) for message in conversation_history)
+    while total_words > max_words and len(conversation_history) > 2:
+        removed_message = conversation_history.pop(0)
+        total_words -= len(removed_message['content'].split())
 
-conversation_history = []
-
-def trim_to_last_complete_sentence(content):
-    last_period_index = content.rfind('.')
-    if last_period_index != -1:
-        return content[:last_period_index + 1]
+def determine_model_and_messages(input_text):
+    if any(word in input_text.lower() for word in focus_keywords):
+        model = "gpt-4o"
+        messages = messages_focus_template
+        max_tokens = 256
+        logging.info("gpt-4o-focus-mode")
+    elif any(word in input_text.lower() for word in vision_keywords):
+        model = "gpt-4o"
+        messages = messages_grid_sequence_template
+        max_tokens = 256
+        logging.info("gpt-4o-grid-sequence-mode")
     else:
-        return content
+        model = "gpt-4o-mini"
+        messages = messages_focus_template
+        max_tokens = 150
+        logging.info("gpt-4o-continious-mode")
+    return model, messages, max_tokens
 
-vision_keywords = os.getenv("VISION_KEYWORDS").split(",")
-focus_keywords = os.getenv("FOCUS_KEYWORDS").split(",")
+async def prepare_messages(messages_template):
+    vision_feed_grid_resized, vision_feed_current_frame_resized = await capture_vision_input()
+    messages = [message.copy() for message in messages_template]
+    
+    if messages_template == messages_focus_template and vision_feed_current_frame_resized is not None:
+        image_frame = image_to_base64_data_uri(vision_feed_current_frame_resized)
+        messages[1]['content'][0]['image_url']['url'] = image_frame
+    elif messages_template == messages_grid_sequence_template and vision_feed_grid_resized is not None:
+        image_grid = image_to_base64_data_uri(vision_feed_grid_resized)
+        messages[1]['content'][0]['image_url']['url'] = image_grid
+    
+    return messages
 
 async def stream_openai_response(client, model, messages, max_tokens, temperature, top_p, frequency_penalty, presence_penalty):
     stream = await client.chat.completions.create(
@@ -336,82 +366,66 @@ async def stream_openai_response(client, model, messages, max_tokens, temperatur
 async def main():
     global stop_recording_event
     client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
+    
+    # Create a ThreadPoolExecutor for audio processing
+    audio_executor = ThreadPoolExecutor(max_workers=2)
+
+    # Get the window title from user input
+    window_title = input("Enter the title of the window: ")
+
+    # Start the background image capture thread
+    background_thread = threading.Thread(target=background_image_capture, args=(window_title,), daemon=True)
+    background_thread.start()
+
+    # Wait for initial frames to be captured
+    logging.info("Loading frames. Please wait...")
+    await asyncio.sleep(10)
 
     while True:
         try:
             threshold = 500
             stop_recording_event.clear()
-            if detect_microphone_input(threshold):
-                stop_audio_playback()  # Stop any ongoing playback
+            
+            # Run microphone input detection in the thread pool
+            loop = asyncio.get_event_loop()
+            if await loop.run_in_executor(audio_executor, detect_microphone_input, threshold):
+                stop_audio_playback()
+                
+                # Run audio recording in the thread pool
                 audio_file = "temp_recording.wav"
-                record_audio_with_threshold(audio_file, threshold)
-                stop_recording_event.set()  # Interrupt any ongoing recording
+                await loop.run_in_executor(audio_executor, record_audio_with_threshold, audio_file, threshold)
+                
+                stop_recording_event.set()
+                
+                # Transcribe audio (this is already async)
                 input_text = await transcribe_with_whisper(audio_file)
                 print(f"User: {input_text}")
-                os.remove(audio_file)
+                await loop.run_in_executor(audio_executor, os.remove, audio_file)
 
-                if any(word in input_text.lower() for word in focus_keywords):
-                    vision_feed_grid_resized, vision_feed_current_frame_resized = await capture_vision_input()
-                    if vision_feed_grid_resized is not None and vision_feed_current_frame_resized is not None:
-                        image_frame = image_to_base64_data_uri(vision_feed_current_frame_resized)
-                        messages_focus = [message.copy() for message in messages_focus_template]
-                        messages_focus[1]['content'][0]['image_url']['url'] = image_frame
+                # Determine the model and prepare messages
+                model, messages_template, max_tokens = determine_model_and_messages(input_text)
+                messages = await prepare_messages(messages_template)
 
-                    model = "gpt-4o"
-                    messages = messages_focus
-                    max_tokens = 256
-                    logging.info("gpt-4o-focus-mode")
-
-                elif any(word in input_text.lower() for word in vision_keywords):
-                    vision_feed_grid_resized, vision_feed_current_frame_resized = await capture_vision_input()
-                    if vision_feed_grid_resized is not None and vision_feed_current_frame_resized is not None:
-                        image_grid = image_to_base64_data_uri(vision_feed_grid_resized)
-                        messages_grid_sequence = [message.copy() for message in messages_grid_sequence_template]
-                        messages_grid_sequence[1]['content'][0]['image_url']['url'] = image_grid
-                        
-                    model = "gpt-4o"
-                    messages = messages_grid_sequence
-                    max_tokens = 256
-                    logging.info("gpt-4o-grid-sequence-mode")
-
-                else:
-                    model = "gpt-3.5-turbo"
-                    messages = messages_txt
-                    max_tokens = 150
-                    logging.info("gpt-3.5-turbo-text-mode")
+                # Trim conversation history if it exceeds 100000 words
+                trim_conversation_history(100000)
 
                 conversation_history.append({"role": "user", "content": input_text})
 
+                # Process OpenAI response and ElevenLabs TTS in parallel
                 full_response = ""
-                sentence_buffer = ""
                 async for sentence in stream_openai_response(client, model, messages + conversation_history, max_tokens, 0.35, 0.75, 1.2, 1.1):
+                    print(f"Assistant: {sentence}")
                     full_response += sentence + " "
-                    sentence_buffer += sentence + " "
                     
-                    # Process and queue audio for complete sentences
-                    if sentence.strip().endswith(('.', '!', '?')):
-                        print(f"Assistant: {sentence_buffer.strip()}")
-                        await process_and_play_streaming(sentence_buffer.strip(), VOICE_ID, EL_API_KEY)
-                        sentence_buffer = ""
+                    # Start ElevenLabs API call immediately for each sentence
+                    await process_and_play_streaming(sentence, VOICE_ID, EL_API_KEY)
 
-                # Process any remaining text in the buffer
-                if sentence_buffer.strip():
-                    print(f"Assistant: {sentence_buffer.strip()}")
-                    await process_and_play_streaming(sentence_buffer.strip(), VOICE_ID, EL_API_KEY)
-
+                # Append the full response to conversation history
                 conversation_history.append({"role": "assistant", "content": full_response.strip()})
 
         except Exception as e:
             logging.error(f"An error occurred: {e}")
             continue
 
-# Start the background image capture thread
-background_thread = threading.Thread(target=background_image_capture, daemon=True)
-background_thread.start()
-
-# Wait for initial frames to be captured
-time.sleep(10)
-
-# Run the main asyncio event loop
 if __name__ == "__main__":
     asyncio.run(main())
