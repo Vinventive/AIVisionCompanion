@@ -113,7 +113,7 @@ async def stream_eleven_labs(text, voice_id, api_key):
     }
     payload = {
         "text": text,
-        "model_id": "eleven_monolingual_v1",
+        "model_id": "eleven_turbo_v2_5",
         "voice_settings": {
             "style": 0.03,
             "stability": 0.60,
