@@ -406,10 +406,10 @@ async def main():
                 logging.info("gpt-4o-grid-sequence-mode")
 
             else:
-                model = "gpt-3.5-turbo"
+                model = "gpt-4o-mini"
                 messages = messages_txt
                 max_tokens = 150
-                logging.info("gpt-3.5-turbo-text-mode")
+                logging.info("gpt-4o-mini-text-mode")
 
             conversation_history.append({"role": "user", "content": input_text})
 
