@@ -388,7 +388,7 @@ async def main():
                     messages_focus = [message.copy() for message in messages_focus_template]
                     messages_focus[1]['content'][0]['image_url']['url'] = image_frame
 
-                model = "gpt-4o"
+                model = "gpt-4o-2024-08-06"
                 messages = messages_focus
                 max_tokens = 256
                 logging.info("gpt-4o-focus-mode")
@@ -400,7 +400,7 @@ async def main():
                     messages_grid_sequence = [message.copy() for message in messages_grid_sequence_template]
                     messages_grid_sequence[1]['content'][0]['image_url']['url'] = image_grid
                 
-                model = "gpt-4o"
+                model = "gpt-4o-2024-08-06"
                 messages = messages_grid_sequence
                 max_tokens = 256
                 logging.info("gpt-4o-grid-sequence-mode")
