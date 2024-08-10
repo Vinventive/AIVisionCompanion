@@ -306,12 +306,12 @@ def trim_conversation_history(max_words):
 
 def determine_model_and_messages(input_text):
     if any(word in input_text.lower() for word in focus_keywords):
-        model = "gpt-4o"
+        model = "gpt-4o-2024-08-06"
         messages = messages_focus_template
         max_tokens = 256
         logging.info("gpt-4o-focus-mode")
     elif any(word in input_text.lower() for word in vision_keywords):
-        model = "gpt-4o"
+        model = "gpt-4o-2024-08-06"
         messages = messages_grid_sequence_template
         max_tokens = 256
         logging.info("gpt-4o-grid-sequence-mode")
