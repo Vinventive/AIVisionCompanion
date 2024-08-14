@@ -261,7 +261,7 @@ async def transcribe_with_whisper(audio_file):
         logging.error(f"Error in transcribe_with_whisper: {e}")
         return "Error in transcription"
 
-def detect_microphone_input(threshold, check_duration=17):
+def detect_microphone_input(threshold, check_duration=26):
     try:
         p = pyaudio.PyAudio()
         stream = p.open(format=pyaudio.paInt16, channels=1, rate=16000, input=True, frames_per_buffer=1024)
@@ -279,12 +279,13 @@ def detect_microphone_input(threshold, check_duration=17):
         stream.close()
         p.terminate()
         
-        return "Share what you think is happening."
+        return False  # Return False if no sound is detected
     except Exception as e:
         logging.error(f"Error in detect_microphone_input: {e}")
-        return False
+        return False  # Ensure it returns False on error as well
 
-def record_audio_with_threshold(file_path, threshold, max_silence_duration=1):
+
+def record_audio_with_threshold(file_path, threshold, max_silence_duration=3):
     try:
         p = pyaudio.PyAudio()
         stream = p.open(format=pyaudio.paInt16, channels=1, rate=16000, input=True, frames_per_buffer=1024)
@@ -380,33 +381,69 @@ async def stream_openai_response(client, model, messages, max_tokens, temperatur
         logging.error(f"Error in stream_openai_response: {e}")
         yield "Error in generating response"
 
+async def initial_scene_recognition(client, vision_feed):
+    messages = [
+        {"role": "system", "content": "You are a helpful AI assistant analyzing a visual scene. Provide a brief, insightful description of what you observe in the current scene."},
+        {"role": "user", "content": [{"type": "image_url", "image_url": {"url": vision_feed}}]}
+    ]
+    
+    response = await client.chat.completions.create(
+        model="gpt-4o",
+        messages=messages,
+        max_tokens=150
+    )
+    
+    return response.choices[0].message.content
+
 async def main():
     global stop_recording_event
     client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
+    continuous_mode = False
+
+    # Capture initial scene and provide description
+    vision_feed_grid_resized, vision_feed_current_frame_resized = await capture_vision_input()
+    if vision_feed_current_frame_resized is not None:
+        image_frame = image_to_base64_data_uri(vision_feed_current_frame_resized)
+        initial_description = await initial_scene_recognition(client, image_frame)
+        print(f"Assistant (Initial Scene Description): {initial_description}")
+        conversation_history.append({"role": "assistant", "content": initial_description})
 
     while True:
         try:
-            threshold = 250
+            threshold = 300
             stop_recording_event.clear()
-            mic_input_result = detect_microphone_input(threshold)
-            
-            if mic_input_result == True:
-                stop_audio_playback()  # Stop any ongoing playback
+            microphone_result = detect_microphone_input(threshold)
+            if microphone_result is True:
+                stop_audio_playback()
                 audio_file = "temp_recording.wav"
-                record_audio_with_threshold(audio_file, threshold)
-                stop_recording_event.set()  # Interrupt any ongoing recording
+                audio_data = record_audio_with_threshold(audio_file, threshold)
+                stop_recording_event.set()
                 input_text = await transcribe_with_whisper(audio_file)
                 print(f"User: {input_text}")
-                os.remove(audio_file)
-            elif mic_input_result == "Share what you think is happening.":
-                input_text = mic_input_result
-                print(f"User: {input_text}")
+
+                # Check for control keywords
+                if "stop continuous mode" in input_text.lower():
+                    continuous_mode = False
+                    print("Continuous mode stopped. Waiting for user input.")
+                    continue
+                elif "start continuous mode" in input_text.lower():
+                    continuous_mode = True
+                    print("Continuous mode started.")
+                    continue
+                elif "exit vision companion" in input_text.lower():
+                    print("Shutting down Vision Companion. Goodbye!")
+                    return
+            elif continuous_mode:
+                input_text = "What do you think is happening?" if microphone_result is False else microphone_result
+                print(f"System: {input_text}")
             else:
-                continue  # Skip this iteration if False is returned
+                continue
+
+
+            vision_feed_grid_resized, vision_feed_current_frame_resized = await capture_vision_input()
 
             if any(word in input_text.lower() for word in focus_keywords):
-                vision_feed_grid_resized, vision_feed_current_frame_resized = await capture_vision_input()
-                if vision_feed_grid_resized is not None and vision_feed_current_frame_resized is not None:
+                if vision_feed_current_frame_resized is not None:
                     image_frame = image_to_base64_data_uri(vision_feed_current_frame_resized)
                     messages_focus = [message.copy() for message in messages_focus_template]
                     messages_focus[1]['content'][0]['image_url']['url'] = image_frame
@@ -414,25 +451,24 @@ async def main():
                 model = "gpt-4o-2024-08-06"
                 messages = messages_focus
                 max_tokens = 256
-                logging.info("gpt-4o-focus-mode")
+                logging.info("gpt-4-vision-focus-mode")
 
             elif any(word in input_text.lower() for word in vision_keywords):
-                vision_feed_grid_resized, vision_feed_current_frame_resized = await capture_vision_input()
-                if vision_feed_grid_resized is not None and vision_feed_current_frame_resized is not None:
+                if vision_feed_grid_resized is not None:
                     image_grid = image_to_base64_data_uri(vision_feed_grid_resized)
                     messages_grid_sequence = [message.copy() for message in messages_grid_sequence_template]
                     messages_grid_sequence[1]['content'][0]['image_url']['url'] = image_grid
-                    
+                
                 model = "gpt-4o-2024-08-06"
                 messages = messages_grid_sequence
                 max_tokens = 256
-                logging.info("gpt-4o-grid-sequence-mode")
+                logging.info("gpt-4-vision-grid-sequence-mode")
 
             else:
                 model = "gpt-4o-mini"
                 messages = messages_txt
                 max_tokens = 150
-                logging.info("gpt-4o-mini-text-mode")
+                logging.info("gpt-4-text-mode")
 
             conversation_history.append({"role": "user", "content": input_text})
 
