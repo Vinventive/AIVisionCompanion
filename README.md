@@ -1,9 +1,9 @@
+# There are several separate branches aside from the 'main' one, each with different version and various architectures and advancements. Be sure to check out the branches and choose the one you are most interested in.
 
 # AI Vision Companion
 
 This repository features source code for an AI vision companion/assistant that merges visual input capture with audio transcription and synthesis through various APIs and libraries. The script detects microphone input, transcribes it, processes vision input from the specified window, and produces responses using a Multimodal Large Language Model and Text-To-Speech.
 
-`There are several separate branches aside from the 'main' one, each with different version and various architectures and advancements. Be sure to check out the branches and choose the one you are most interested in.`
 
 ## Features
 
