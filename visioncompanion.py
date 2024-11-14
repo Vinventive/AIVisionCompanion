@@ -100,6 +100,7 @@ pipe = pipeline(
 output_dir = 'outputs'
 os.makedirs(output_dir, exist_ok=True)
 
+# Updated: audio_queue now holds tuples of (AudioSegment, message)
 audio_queue = queue.Queue()
 playback_thread = None
 playback_stop_event = threading.Event()
@@ -116,6 +117,7 @@ def log_memory_usage():
     if torch.cuda.is_available():
         logging.info(f"GPU memory allocated: {torch.cuda.memory_allocated() / 1024 / 1024:.2f} MB")
 
+# Updated: audio_playback_worker now takes messages along with audio
 def audio_playback_worker():
     p = pyaudio.PyAudio()
     stream = p.open(format=pyaudio.paInt16,
@@ -125,7 +127,7 @@ def audio_playback_worker():
 
     while not playback_stop_event.is_set():
         try:
-            audio_segment = audio_queue.get(timeout=0.1)
+            audio_segment, message = audio_queue.get(timeout=0.1)
             chunk_size = 1024
             for i in range(0, len(audio_segment), chunk_size):
                 if playback_stop_event.is_set():
@@ -133,6 +135,10 @@ def audio_playback_worker():
                 chunk = audio_segment[i:i+chunk_size].raw_data
                 stream.write(chunk)
             audio_queue.task_done()
+
+            # After playback, send the message through socket
+            send_message_to_clients(message)
+
         except queue.Empty:
             continue
         except Exception as e:
@@ -178,12 +184,13 @@ def transcribe_with_whisper_sync(audio_data):
         logging.error(f"Error in transcribe_with_whisper: {e}")
         return "Error in transcription"
 
-def process_and_play_streaming(audio_data):
+# Updated: process_and_play_streaming now takes the message to send after playback
+def process_and_play_streaming(audio_data, message):
     try:
         if audio_data:
             audio_segment = AudioSegment.from_wav(io.BytesIO(audio_data))
             audio_segment = audio_segment.set_channels(1).set_frame_rate(44100)
-            audio_queue.put(audio_segment)
+            audio_queue.put((audio_segment, message))
             start_audio_playback_thread()
     except Exception as e:
         logging.error(f"Error in process_and_play_streaming: {e}")
@@ -751,17 +758,14 @@ async def main(executor, use_gui):
                         # Replace exclamation marks with single dot for TTS processing
                         sentence_for_tts = sentence_buffer.strip().replace('!', '.')
 
-                        # Offload TTS synthesis to a thread
+                        # Offload TTS synthesis to a thread and provide the message to send after playback
                         audio_data = await loop.run_in_executor(
                             executor, generate_audio_sync, sentence_for_tts, tts_model_name
                         )
                         if audio_data:
-                            process_and_play_streaming(audio_data)
+                            process_and_play_streaming(audio_data, sentence_buffer.strip())
                         else:
                             logging.warning("Failed to generate audio, skipping playback")
-
-                        # Send the original sentence to connected clients
-                        send_message_to_clients(sentence_buffer.strip())
 
                         sentence_buffer = ""
 
@@ -776,7 +780,7 @@ async def main(executor, use_gui):
                         executor, generate_audio_sync, sentence_for_tts, tts_model_name
                     )
                     if audio_data:
-                        process_and_play_streaming(audio_data)
+                        process_and_play_streaming(audio_data, sentence_buffer.strip())
                     else:
                         logging.warning("Failed to generate audio, skipping playback")
 
