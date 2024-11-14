@@ -1,4 +1,6 @@
 numpy
+torch
+torchaudio
 python-dotenv
 einops
 pyaudio
